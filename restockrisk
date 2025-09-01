@@ -1,0 +1,222 @@
+
+import io
+import math
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="SKU 断货风险评估（A/B 物流）", layout="wide")
+
+st.title("📦 SKU 断货风险评估（A/B 物流）")
+st.caption("根据出货表（英文名称+SKU+尺码配比）、库存表（SKU编码+当前库存）、以及日均销量/增长系数，评估在不同物流到货天数下的断货风险。")
+
+# -- Sidebar params --
+st.sidebar.header("⚙️ 参数设置")
+lead_days_a = st.sidebar.number_input("A 渠道到货天数", min_value=1, max_value=60, value=8, step=1)
+lead_days_b = st.sidebar.number_input("B 渠道到货天数", min_value=1, max_value=60, value=13, step=1)
+lead_days = st.sidebar.radio("选择要评估的渠道", options=[("A 渠道", lead_days_a), ("B 渠道", lead_days_b)], index=1, format_func=lambda x: x[0])[1]
+
+st.sidebar.markdown("---")
+equal_share_default = st.sidebar.checkbox("当出货表无尺码拆分时使用 S/M/L 平均拆分（1/3）", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📁 上传数据文件")
+shipment_file = st.sidebar.file_uploader("出货表（CSV）必须包含列：英文名称、SKU、S数量、M数量、L数量", type=["csv"])
+inventory_file = st.sidebar.file_uploader("库存表（CSV）必须包含列：SKU编码、当前库存（示例：NPF001-S）", type=["csv"])
+restock_file = st.sidebar.file_uploader("销量增长表（XLSX/CSV）必须包含列：Variation Name、日均销量、增长系数", type=["xlsx","csv"])
+
+st.markdown("### 使用说明")
+with st.expander("点击展开"):
+    st.markdown("""
+    1. 在左侧上传三张表：  
+       - **出货表（CSV）**：至少包含 `英文名称, SKU, S数量, M数量, L数量`  
+       - **库存表（CSV）**：至少包含 `SKU编码, 当前库存`，SKU编码形如 `NPF001-S`  
+       - **销量增长表（XLSX/CSV）**：至少包含 `Variation Name, 日均销量, 增长系数`  
+    2. 在左侧选择渠道（A=8天，B=13天，或自定义），点击下方按钮计算。
+    3. 支持下载结果 CSV。
+    """)
+
+def _safe_read(file):
+    if file is None:
+        return None
+    name = file.name.lower()
+    if name.endswith(".xlsx"):
+        return pd.read_excel(file)
+    else:
+        return pd.read_csv(file)
+
+def compute_stockout_risk(a_chain: pd.DataFrame, inventory: pd.DataFrame, restock: pd.DataFrame, lead_days: int = 13, use_equal_share_if_missing=True) -> pd.DataFrame:
+    # 清洗并保留需要的列
+    cols_ship = ["英文名称","SKU","S数量","M数量","L数量"]
+    missing_ship = [c for c in cols_ship if c not in a_chain.columns]
+    if missing_ship:
+        raise ValueError(f"出货表缺少列: {missing_ship}")
+    ship = a_chain[cols_ship].dropna(subset=["SKU"]).copy()
+    for c in ["S数量","M数量","L数量"]:
+        ship[c] = pd.to_numeric(ship[c], errors="coerce").fillna(0.0)
+
+    # 尺码占比
+    ship["总数量"] = ship[["S数量","M数量","L数量"]].sum(axis=1)
+    def compute_shares(row):
+        total = row["总数量"]
+        if total and total > 0:
+            return pd.Series({
+                "share_S": row["S数量"]/total,
+                "share_M": row["M数量"]/total,
+                "share_L": row["L数量"]/total
+            })
+        else:
+            if use_equal_share_if_missing:
+                return pd.Series({"share_S": 1/3, "share_M": 1/3, "share_L": 1/3})
+            else:
+                return pd.Series({"share_S": np.nan, "share_M": np.nan, "share_L": np.nan})
+    ship = pd.concat([ship, ship.apply(compute_shares, axis=1)], axis=1)
+
+    # 名称映射
+    if "Variation Name" not in restock.columns or "日均销量" not in restock.columns or "增长系数" not in restock.columns:
+        raise ValueError("销量增长表需包含列：Variation Name, 日均销量, 增长系数")
+    name_to_sku = ship.set_index("英文名称")["SKU"].to_dict()
+    r = restock.copy()
+    r["base_SKU"] = r["Variation Name"].map(name_to_sku)
+
+    # 仅评估出货表中存在映射的款式
+    r_ship = r.dropna(subset=["base_SKU"]).copy()
+
+    # 合并尺码占比
+    r_ship = r_ship.merge(
+        ship[["英文名称","SKU","share_S","share_M","share_L"]].rename(columns={"SKU":"base_SKU"}),
+        on=["base_SKU"],
+        how="left"
+    )
+
+    # 库存拆分
+    if "SKU编码" not in inventory.columns or "当前库存" not in inventory.columns:
+        raise ValueError("库存表需包含列：SKU编码, 当前库存")
+    inv = inventory.copy()
+    inv["base_SKU"] = inv["SKU编码"].astype(str).str.split("-").str[0]
+    inv["size"] = inv["SKU编码"].astype(str).str.split("-").str[1]
+    inv_pivot = inv.pivot_table(index=["base_SKU"], columns="size", values="当前库存", aggfunc="sum").fillna(0)
+    for s in ["S","M","L"]:
+        if s not in inv_pivot.columns:
+            inv_pivot[s] = 0
+    inv_pivot = inv_pivot.reset_index()
+
+    # 聚合到 base_SKU（若增长表有重复款式，只取第一条即可；也可改为别的策略）
+    r_base = r_ship.groupby("base_SKU", as_index=False).first()
+    df = r_base.merge(inv_pivot, on="base_SKU", how="left")
+
+    # 缺省占比填充
+    for col in ["share_S","share_M","share_L"]:
+        if col not in df.columns:
+            df[col] = np.nan
+    df[["share_S","share_M","share_L"]] = df[["share_S","share_M","share_L"]].fillna(1/3 if use_equal_share_if_missing else 0)
+
+    # 需求预测（增长系数假设为“周”口径，转为“日”口径）
+    def project_demand(daily_avg, growth_coef, share, days):
+        if pd.isna(daily_avg) or daily_avg is None:
+            return 0.0
+        try:
+            daily_avg = float(daily_avg)
+        except:
+            daily_avg = 0.0
+        try:
+            g = float(growth_coef)
+            g_daily = (g ** (1/7.0)) if g > 0 else 1.0
+        except:
+            g_daily = 1.0
+        base = daily_avg * float(share or 0)
+        if abs(g_daily - 1.0) < 1e-9:
+            return base * days
+        else:
+            return float(base * (1 - (g_daily ** days)) / (1 - g_daily))
+
+    for s in ["S","M","L"]:
+        df[f"proj{s}_{lead_days}d"] = df.apply(lambda r: project_demand(r.get("日均销量"), r.get("增长系数"), r.get(f"share_{s}"), lead_days), axis=1)
+
+    # 逐日扣减看最早断货日
+    def stockout_day(initial, daily_avg, growth_coef, share, days):
+        stock = float(initial) if pd.notna(initial) else 0.0
+        try:
+            daily_avg = float(daily_avg)
+        except:
+            daily_avg = 0.0
+        try:
+            g = float(growth_coef)
+            g_daily = (g ** (1/7.0)) if g > 0 else 1.0
+        except:
+            g_daily = 1.0
+        demand_today = daily_avg * float(share or 0)
+        for d in range(1, days+1):
+            stock -= demand_today
+            if stock < 0:
+                return d
+            demand_today *= g_daily
+        return np.nan
+
+    for s in ["S","M","L"]:
+        df[f"stockout_day_{s}"] = df.apply(lambda r: stockout_day(r.get(s,0), r.get("日均销量"), r.get("增长系数"), r.get(f"share_{s}"), lead_days), axis=1)
+        df[f"risk_{s}"] = df[f"stockout_day_{s}"].notna()
+
+    df["risk_any_size"] = df[[f"risk_{s}" for s in ["S","M","L"]]].any(axis=1)
+
+    out_cols = [
+        "Variation Name","base_SKU","日均销量","增长系数",
+        "S","M","L","share_S","share_M","share_L",
+        f"projS_{lead_days}d", f"projM_{lead_days}d", f"projL_{lead_days}d",
+        "stockout_day_S","stockout_day_M","stockout_day_L",
+        "risk_S","risk_M","risk_L","risk_any_size"
+    ]
+    result = df[out_cols].copy()
+    result = result.rename(columns={
+        "S":"当前库存_S","M":"当前库存_M","L":"当前库存_L",
+        "risk_any_size": f"{lead_days}天内是否存在断货风险"
+    })
+    # 计算最早断货天数（任一尺码）
+    def earliest(row):
+        days = [row["stockout_day_S"], row["stockout_day_M"], row["stockout_day_L"]]
+        days = [d for d in days if pd.notna(d)]
+        return min(days) if days else np.nan
+    result["最早断货天数(任一尺码)"] = result.apply(earliest, axis=1)
+    # 排序：先有风险的，再按最早断货天数升序
+    result = result.sort_values(by=[f"{lead_days}天内是否存在断货风险","最早断货天数(任一尺码)"], ascending=[False, True])
+    return result
+
+# -- Run --
+if st.button(f"🚀 计算 {lead_days} 天断货风险", use_container_width=True):
+    try:
+        a_chain = _safe_read(shipment_file)
+        inventory = _safe_read(inventory_file)
+        restock = _safe_read(restock_file)
+        if any(x is None for x in [a_chain, inventory, restock]):
+            st.error("请先上传三张表再计算。")
+        else:
+            res = compute_stockout_risk(a_chain, inventory, restock, lead_days=lead_days, use_equal_share_if_missing=equal_share_default)
+
+            # KPI 区
+            total = int(res.shape[0])
+            risky = int(res[f"{lead_days}天内是否存在断货风险"].sum())
+            col1, col2, col3 = st.columns(3)
+            col1.metric("覆盖 base SKU 数", total)
+            col2.metric("存在断货风险（任一尺码）", risky)
+            ratio = f"{(risky/total*100):.1f}%" if total else "0.0%"
+            col3.metric("风险占比", ratio)
+
+            st.markdown("### 结果明细")
+            st.dataframe(res, use_container_width=True, height=520)
+
+            # 下载
+            csv = res.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="⬇️ 下载结果 CSV",
+                data=csv,
+                file_name=f"stockout_risk_{lead_days}days.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+            st.success("计算完成 ✅")
+    except Exception as e:
+        st.exception(e)
+
+st.markdown("---")
+st.markdown("**提示：** 如需在本地直接使用脚本批处理，可参考我们随附的 `stockout_risk_b_channel.py`，或将本页面的逻辑改为命令行调用。")
